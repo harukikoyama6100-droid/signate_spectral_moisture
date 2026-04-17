@@ -1,0 +1,184 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from google.colab import drive
+drive.mount('/content/drive')
+pd.set_option('display.max_rows', 10000) #縦の表示(件数)
+pd.set_option('display.max_columns', 10000) #横の表示(列数)
+
+df_train = pd.read_csv('/content/drive/MyDrive/Colab Notebooks/SIGNATE/近赤外：木材の含水率推定/train (1).csv', encoding='cp932')
+df_train.head()
+
+import scipy as sp
+from scipy import signal
+#1次微分をdf_trainの後ろにくっつける
+df_spec = df_train.iloc[:, 4:]
+df_train_1 = signal.savgol_filter(df_spec, 9, 1, deriv=1)
+df_train_1 = pd.DataFrame(df_train_1)
+df_train_1.columns = df_train.iloc[:, 4:].columns
+
+#に次微分
+df_train_2 = signal.savgol_filter(df_spec, 9, 2, deriv=2)
+df_train_2 = pd.DataFrame(df_train_2)
+df_train_2.columns = df_train.iloc[:, 4:].columns
+
+#スペクトル波長を見たい
+# 同じspecies numberから2つのサンプルを選択
+species = 14 # Species numberを2から1に変更。または、df_trainに存在するspecies numberを指定してください。
+species_1_samples = df_train[df_train['species number'] == species].iloc[:, 4:]
+
+# 各サンプルのスペクトルデータを取得
+sample_1 = 40
+sample_2 = 110
+sample_spectrum_1 = species_1_samples.iloc[sample_1] # 最初のサンプルのスペクトルデータ
+sample_spectrum_2 = species_1_samples.iloc[sample_2] # 2番目のサンプルのスペクトルデータ
+
+# 波長（カラム名）を数値に変換
+wavelengths = sample_spectrum_1.index.astype(float)
+
+# スペクトルデータをプロット
+plt.figure(figsize=(12, 6))
+plt.plot(wavelengths, sample_spectrum_1, label=f'Sample {species_1_samples.index[0]}')
+plt.plot(wavelengths, sample_spectrum_2, label=f'Sample {species_1_samples.index[1]}')
+plt.xlabel('Wavelength (nm)')
+plt.ylabel('Intensity')
+plt.title(f'Spectral Wavelength of Two Samples from Species {df_train[df_train['species number'] == species]['species number'].iloc[0]}')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+#5000から5500の最大値-最小値という特徴量と含水率に関する相関を見てみる
+band_5000 = '5002.66957'
+band_5500 = '5500.23655'
+
+df_band = df_train.loc[:, band_5500:band_5000].copy()
+
+df_plot = df_band
+df_plot['max_min'] = df_band.max(axis=1) - df_band.min(axis=1)
+df_plot['含水率'] = df_train['含水率'].values
+
+sns.scatterplot(data=df_plot, x='max_min', y='含水率')
+plt.show()
+
+print(df_plot[['max_min', '含水率']].corr())
+
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.model_selection import GroupKFold
+from sklearn.metrics import root_mean_squared_error
+import lightgbm as lgb
+
+#波長抽出→各帯域で標準化→各帯域でpca→LightGBMの順番でモデル構築を行う
+band_5000 = '5002.66957'
+band_5500 = '5500.23655'
+
+#波長抽出
+df_train_5000 = df_train.loc[:, band_5500:band_5000]
+df_train_1_5000 = df_train_1.loc[:, band_5500:band_5000]
+df_train_2_5000 = df_train_2.loc[:, band_5500:band_5000]
+
+n_5000 = 2
+n_1_5000 = 0
+n_2_5000 = 3
+
+gkf = GroupKFold(n_splits=5, shuffle=True, random_state=42)
+
+#CVデータに分割する関数
+def CV_split(df_train, train_index, valid_index):
+  train, valid = df_train.iloc[train_index].copy(), df_train.iloc[valid_index].copy()
+  return train, valid
+
+#標準化を学習データのみで行い、評価データに適応する関数
+def Scaler(train, valid):
+  scaler = StandardScaler()
+  scaled_train = scaler.fit_transform(train)
+  scaled_valid = scaler.transform(valid)
+  return scaled_train, scaled_valid
+
+#SNVを実装する関数
+def SNV(train, valid):
+    train_std = train.std(axis=1).replace(0, 1)
+    valid_std = valid.std(axis=1).replace(0, 1)
+
+    snv_train = train.sub(train.mean(axis=1), axis=0).div(train_std, axis=0)
+    snv_valid = valid.sub(valid.mean(axis=1), axis=0).div(valid_std, axis=0)
+    return snv_train, snv_valid
+
+#主成分分析を学習データのみで行い、評価データに適応する関数
+def apply_PCA(train, valid, n):
+  pca = PCA(n_components=n)
+  pca_train = pca.fit_transform(train)
+  pca_valid = pca.transform(valid)
+  return pca_train, pca_valid
+
+rmse_list = []
+
+# パラメータの設定
+params = {
+    "objective": "regression",
+    "metric": "rmse",
+    "verbosity": -1,
+    "boosting_type": "gbdt",
+    "random_state": 42,
+    "num_leaves": 15,
+    "max_depth": 5,
+    "min_data_in_leaf": 50,
+    "feature_fraction": 0.8,
+    "bagging_fraction": 0.8,
+    "bagging_freq": 1,
+    "lambda_l2": 1.0,
+    "learning_rate": 0.05
+}
+
+
+groups = df_train['species number']
+#ここからCVで処理する
+for k, (train_index, valid_index) in enumerate(gkf.split(df_train, groups=groups)):
+  #trainとvalidに分解
+  train_5000, valid_5000 = CV_split(df_train_5000, train_index, valid_index)
+  train_1_5000, valid_1_5000 = CV_split(df_train_1_5000, train_index, valid_index)
+  train_2_5000, valid_2_5000 = CV_split(df_train_2_5000, train_index, valid_index)
+
+  #SNV
+  snv_train_5000, snv_valid_5000 = SNV(train_5000, valid_5000)
+
+  #pca処理
+  pca_train_5000, pca_valid_5000 = apply_PCA(snv_train_5000, snv_valid_5000, n_5000)
+  pca_train_1_5000, pca_valid_1_5000 = apply_PCA(train_1_5000, valid_1_5000, n_1_5000)
+  pca_train_2_5000, pca_valid_2_5000 = apply_PCA(train_2_5000, valid_2_5000, n_2_5000)
+
+  #ベースライン特徴量を作成する(一旦端っこ)
+  train_base = df_spec.iloc[train_index].mean(axis=1).to_numpy().reshape(-1, 1)
+  valid_base = df_spec.iloc[valid_index].mean(axis=1).to_numpy().reshape(-1, 1)
+
+  #作成した特徴量を横につなげる
+  X_train_combined = np.hstack((pca_train_5000, pca_train_1_5000, pca_train_2_5000, train_base))
+  X_valid_combined = np.hstack((pca_valid_5000, pca_valid_1_5000, pca_valid_2_5000, valid_base))
+
+  X_train = X_train_combined
+  X_valid = X_valid_combined
+
+  y_train = df_train['含水率'].iloc[train_index]
+  y_valid = df_train['含水率'].iloc[valid_index]
+
+  #LightGBM部分
+  train_data = lgb.Dataset(X_train, label=y_train)
+
+  #モデル学習
+  model = lgb.train(
+      params,
+      train_data
+  )
+
+  #モデル評価
+  y_pred = model.predict(X_valid)
+  rmse = root_mean_squared_error(y_valid, y_pred)
+  print(f'{k}Fold:rmse = {rmse}')
+  rmse_list.append(rmse)
+print(f'平均rmse:{np.mean(rmse_list)}')
