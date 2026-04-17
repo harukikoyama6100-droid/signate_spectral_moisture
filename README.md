@@ -1,0 +1,2 @@
+# signate_spectral_moisture
+SIGNATEで開催されている近赤外スペクトルから含水率を予測するモデル作成
